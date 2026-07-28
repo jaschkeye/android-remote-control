@@ -13,18 +13,19 @@ export default function App() {
   const selectedSerialRef = useRef<string | null>(null);
 
   useEffect(() => {
-    window.electronAPI.onDevicesChanged((devs) => {
+    const unsubDevices = window.electronAPI.onDevicesChanged((devs) => {
       setDevices(devs);
       if (devs.length > 0 && !selectedSerialRef.current) {
         const connected = devs.find((d) => d.forwardedPort);
         if (connected) setSelectedSerial(connected.serial);
       }
     });
-    window.electronAPI.onDeployStatus((status) => {
+    const unsubDeploy = window.electronAPI.onDeployStatus((status) => {
       setDeployStatus((prev) => ({ ...prev, [status.serial]: status }));
     });
 
     window.electronAPI.getDevices().then(setDevices);
+    return () => { unsubDevices(); unsubDeploy(); };
   }, []);
 
   const handleSelect = useCallback((serial: string) => {
@@ -48,11 +49,12 @@ export default function App() {
 
   // Listen for agent done/error to update running state
   useEffect(() => {
-    window.electronAPI.onAgentEvent((event) => {
+    const unsub = window.electronAPI.onAgentEvent((event) => {
       if (event.type === 'done' || event.type === 'error' || event.type === 'max-iterations') {
         setAgentRunning(false);
       }
     });
+    return unsub;
   }, []);
 
   const selectedDevice = devices.find((d) => d.serial === selectedSerial);

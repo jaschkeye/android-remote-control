@@ -1,7 +1,74 @@
+/**
+ * AI Agent Engine
+ * 
+ * Core perception-decision-execution loop for Android automation.
+ * Uses vision LLM (GPT-4o / compatible) to analyze screenshots and decide actions.
+ * 
+ * Flow: screenshot → LLM vision analysis → ADB action execution → repeat
+ */
+
 const { execFile } = require('child_process');
 const { EventEmitter } = require('events');
 
 const LOG_PREFIX = '[AgentEngine]';
+
+const SYSTEM_PROMPT = `你是一个专业的 Android 手机操控助手。用户会给你一个任务目标，你需要通过分析手机屏幕截图来决定下一步操作。
+
+## 可执行的动作
+
+返回一个 JSON 对象，包含 type 和对应参数：
+
+### 点击
+{"type":"tap","x":500,"y":800}
+在指定坐标处点击。
+
+### 滑动
+{"type":"swipe","x1":500,"y1":1000,"x2":500,"y2":200,"duration":300}
+从 (x1,y1) 滑动到 (x2,y2)，duration 单位为毫秒。向上滑动查看更多内容，向下滑动刷新。
+
+### 输入文字
+{"type":"text","text":"要输入的文字"}
+在当前焦点输入框中输入文字。仅支持英文和数字，中文需要使用输入法。
+
+### 按键
+{"type":"keyevent","keycode":4}
+常用按键码：3=HOME, 4=BACK, 5=呼叫, 24=音量+, 25=音量-, 26=电源, 27=相机, 66=回车, 84=搜索, 187=最近任务
+
+### 长按
+{"type":"longpress","x":500,"y":800,"duration":1000}
+在指定坐标处长按指定时间。
+
+### 启动应用
+{"type":"launch","package":"com.tencent.mm"}
+通过包名启动应用。常用包名：
+- 微信: com.tencent.mm
+- QQ: com.tencent.mobileqq
+- 支付宝: com.eg.android.AlipayGphone
+- 抖音: com.ss.android.ugc.aweme
+- 设置: com.android.settings
+- 浏览器: com.android.browser
+- 电话: com.android.dialer
+- 短信: com.android.mms
+- 相机: com.android.camera
+
+### 等待
+{"type":"wait","duration":2000}
+等待指定毫秒数，让界面加载完成。
+
+### 任务完成
+{"type":"done","summary":"任务完成的简要说明"}
+当任务目标已经达成时返回。
+
+## 规则
+
+1. **只返回一个 JSON 对象**，不要包含 markdown 标记（不要用 \`\`\`json）、不要解释文字
+2. 坐标基于截图的实际像素尺寸，会在每次消息中提供
+3. 每次只执行一个动作，不要合并多个动作
+4. 如果当前界面已经可以完成任务，直接执行；如果需要多步，逐步执行
+5. 如果界面正在加载，使用 wait 动作等待
+6. 如果找不到目标元素，尝试滑动或使用返回键
+7. 优先使用 launch 动作启动应用，而不是从桌面查找图标
+8. 对于需要输入文字的场景，先点击输入框获取焦点，再输入文字`;
 
 class AgentEngine extends EventEmitter {
   constructor(options) {
@@ -14,10 +81,11 @@ class AgentEngine extends EventEmitter {
     this.maxIterations = options.maxIterations || 20;
     this.running = false;
     this.iteration = 0;
+    this.screenSize = null; // {width, height} cached from device
   }
 
   /**
-   * 截图，返回 PNG Buffer
+   * Capture screenshot, return PNG Buffer
    * @returns {Promise<Buffer>}
    */
   captureScreen() {
@@ -29,15 +97,11 @@ class AgentEngine extends EventEmitter {
         { maxBuffer: 10 * 1024 * 1024, encoding: 'buffer' },
         (error, stdout) => {
           if (error) {
-            const msg = `截图失败: ${error.message}`;
-            this._log(msg);
-            reject(new Error(msg));
+            reject(new Error(`截图失败: ${error.message}`));
             return;
           }
           if (!stdout || stdout.length === 0) {
-            const msg = '截图失败: 返回数据为空';
-            this._log(msg);
-            reject(new Error(msg));
+            reject(new Error('截图失败: 返回数据为空'));
             return;
           }
           this._log(`截图成功, 大小: ${stdout.length} bytes`);
@@ -48,7 +112,7 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 截图并转为 base64 字符串
+   * Capture screenshot and convert to base64
    * @returns {Promise<string>}
    */
   async captureScreenBase64() {
@@ -57,28 +121,23 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 通过 adb shell wm size 获取设备分辨率
+   * Get device screen size via adb shell wm size
    * @returns {Promise<{width: number, height: number}>}
    */
   getScreenSize() {
     return new Promise((resolve, reject) => {
-      this._log('Getting screen size...');
       execFile(
         this.adbPath,
         ['-s', this.serial, 'shell', 'wm', 'size'],
         { maxBuffer: 1024 * 1024 },
         (error, stdout) => {
           if (error) {
-            const msg = `获取屏幕尺寸失败: ${error.message}`;
-            this._log(msg);
-            reject(new Error(msg));
+            reject(new Error(`获取屏幕尺寸失败: ${error.message}`));
             return;
           }
           const match = stdout.match(/(\d+)x(\d+)/);
           if (!match) {
-            const msg = `解析屏幕尺寸失败: ${stdout.trim()}`;
-            this._log(msg);
-            reject(new Error(msg));
+            reject(new Error(`解析屏幕尺寸失败: ${stdout.trim()}`));
             return;
           }
           const size = { width: parseInt(match[1], 10), height: parseInt(match[2], 10) };
@@ -90,120 +149,87 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 执行一个结构化动作
-   * @param {object} action
+   * Execute a structured action
+   * @param {object} action - Action object with type and parameters
    * @returns {Promise<{success: boolean, detail: string}>}
    */
-  executeAction(action) {
-    return new Promise((resolve, reject) => {
-      if (!action || !action.type) {
-        reject(new Error('无效的动作: 缺少 type 字段'));
-        return;
-      }
+  async executeAction(action) {
+    if (!action || !action.type) {
+      return { success: false, detail: '无效的动作: 缺少 type 字段' };
+    }
 
-      this._log(`执行动作: ${JSON.stringify(action)}`);
+    this._log(`执行动作: ${JSON.stringify(action)}`);
 
+    try {
       switch (action.type) {
         case 'tap':
-          this._execAdb(['shell', 'input', 'tap', String(action.x), String(action.y)])
-            .then(() => resolve({ success: true, detail: `点击 (${action.x}, ${action.y})` }))
-            .catch((err) => resolve({ success: false, detail: err.message }));
-          break;
+          await this._execAdb(['shell', 'input', 'tap', String(Math.round(action.x)), String(Math.round(action.y))]);
+          return { success: true, detail: `点击 (${Math.round(action.x)}, ${Math.round(action.y)})` };
 
         case 'swipe':
-          this._execAdb([
+          await this._execAdb([
             'shell', 'input', 'swipe',
-            String(action.x1), String(action.y1),
-            String(action.x2), String(action.y2),
+            String(Math.round(action.x1)), String(Math.round(action.y1)),
+            String(Math.round(action.x2)), String(Math.round(action.y2)),
             String(action.duration || 300)
-          ])
-            .then(() => resolve({ success: true, detail: `滑动 (${action.x1},${action.y1}) -> (${action.x2},${action.y2})` }))
-            .catch((err) => resolve({ success: false, detail: err.message }));
-          break;
+          ]);
+          return { success: true, detail: `滑动 (${Math.round(action.x1)},${Math.round(action.y1)}) → (${Math.round(action.x2)},${Math.round(action.y2)})` };
 
         case 'text':
-          this._execAdb(['shell', 'input', 'text', action.text])
-            .then(() => resolve({ success: true, detail: `输入文字: ${action.text}` }))
-            .catch((err) => resolve({ success: false, detail: err.message }));
-          break;
+          await this._execAdb(['shell', 'input', 'text', String(action.text)]);
+          return { success: true, detail: `输入文字: ${action.text}` };
 
         case 'keyevent':
-          this._execAdb(['shell', 'input', 'keyevent', String(action.keycode)])
-            .then(() => resolve({ success: true, detail: `按键: ${action.keycode}` }))
-            .catch((err) => resolve({ success: false, detail: err.message }));
-          break;
+          await this._execAdb(['shell', 'input', 'keyevent', String(action.keycode)]);
+          return { success: true, detail: `按键: ${action.keycode}` };
 
         case 'longpress':
-          this._execAdb([
+          await this._execAdb([
             'shell', 'input', 'swipe',
-            String(action.x), String(action.y),
-            String(action.x), String(action.y),
+            String(Math.round(action.x)), String(Math.round(action.y)),
+            String(Math.round(action.x)), String(Math.round(action.y)),
             String(action.duration || 1000)
-          ])
-            .then(() => resolve({ success: true, detail: `长按 (${action.x}, ${action.y}) ${action.duration || 1000}ms` }))
-            .catch((err) => resolve({ success: false, detail: err.message }));
-          break;
+          ]);
+          return { success: true, detail: `长按 (${Math.round(action.x)}, ${Math.round(action.y)}) ${action.duration || 1000}ms` };
+
+        case 'launch':
+          await this._execAdb(['shell', 'monkey', '-p', String(action.package), '-c', 'android.intent.category.LAUNCHER', '1']);
+          return { success: true, detail: `启动应用: ${action.package}` };
 
         case 'wait':
-          setTimeout(() => {
-            this._log(`等待 ${action.duration}ms`);
-            resolve({ success: true, detail: `等待 ${action.duration}ms` });
-          }, action.duration || 2000);
-          break;
+          await this._sleep(action.duration || 2000);
+          return { success: true, detail: `等待 ${action.duration || 2000}ms` };
 
         case 'done':
-          resolve({ success: true, detail: action.summary || '任务完成' });
-          break;
+          return { success: true, detail: action.summary || '任务完成' };
 
         default:
-          resolve({ success: false, detail: `未知动作类型: ${action.type}` });
-          break;
+          return { success: false, detail: `未知动作类型: ${action.type}` };
       }
-    });
+    } catch (err) {
+      return { success: false, detail: err.message };
+    }
   }
 
   /**
-   * 调用视觉大模型 API 分析当前屏幕，返回下一步动作
-   * @param {string} imageBase64
-   * @param {string} userGoal
-   * @param {Array} history
-   * @returns {Promise<object>}
+   * Call vision LLM API to analyze current screen and decide next action
+   * @param {string} imageBase64 - Base64 encoded PNG screenshot
+   * @param {string} userGoal - User's natural language task goal
+   * @param {Array} history - Previous action history
+   * @returns {Promise<object>} - Next action to execute
    */
   async analyzeScreen(imageBase64, userGoal, history) {
     this._log('正在分析屏幕...');
 
-    const systemContent = `你是一个 Android 手机操控助手。用户会给你一个任务目标，你需要通过分析手机屏幕截图来决定下一步操作。
+    const sizeInfo = this.screenSize
+      ? `当前屏幕分辨率: ${this.screenSize.width}x${this.screenSize.height}`
+      : '屏幕分辨率未知';
 
-你可以执行以下动作（只返回 JSON，不要其他文字）：
-- {"type":"tap","x":500,"y":800} - 点击坐标
-- {"type":"swipe","x1":500,"y1":1000,"x2":500,"y2":200,"duration":300} - 滑动
-- {"type":"text","text":"要输入的文字"} - 输入文字
-- {"type":"keyevent","keycode":4} - 按键(3=HOME,4=BACK,66=ENTER,27=电源)
-- {"type":"longpress","x":500,"y":800,"duration":1000} - 长按
-- {"type":"wait","duration":2000} - 等待
-- {"type":"done","summary":"任务完成说明"} - 任务完成
-
-规则：
-1. 只返回一个 JSON 对象，不要包含 markdown 标记或解释文字
-2. 坐标基于截图的实际像素尺寸
-3. 如果任务已完成，返回 done 类型
-4. 每次只执行一个动作`;
-
-    const userMessages = [
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: `任务目标: ${userGoal}\n\n这是当前手机屏幕截图，请分析并返回下一步操作。` },
-          { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } }
-        ]
-      }
-    ];
-
-    // 如果有历史记录，作为中间对话添加到 messages 中
     const messages = [
-      { role: 'system', content: systemContent }
+      { role: 'system', content: SYSTEM_PROMPT },
     ];
 
+    // Add conversation history
     if (history && history.length > 0) {
       for (const entry of history) {
         messages.push({
@@ -212,79 +238,82 @@ class AgentEngine extends EventEmitter {
         });
         messages.push({
           role: 'user',
-          content: `动作执行${entry.result && entry.result.success ? '成功' : '失败'}: ${entry.result ? entry.result.detail : ''}\n\n这是当前手机屏幕截图，请分析并返回下一步操作。`
+          content: `上一步执行${entry.result && entry.result.success ? '成功' : '失败'}: ${entry.result ? entry.result.detail : ''}\n\n${sizeInfo}\n这是当前手机屏幕截图，请分析并返回下一步操作。`
         });
       }
+    } else {
+      messages.push({
+        role: 'user',
+        content: `任务目标: ${userGoal}\n\n${sizeInfo}\n这是当前手机屏幕截图，请分析并返回下一步操作。`
+      });
     }
 
-    messages.push(userMessages[0]);
+    // Always include the current screenshot
+    const lastMsg = messages[messages.length - 1];
+    lastMsg.content = [
+      { type: 'text', text: lastMsg.content },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${imageBase64}` } }
+    ];
 
     const requestBody = {
       model: this.model,
-      messages: messages,
-      max_tokens: 300,
-      temperature: 0.1
+      messages,
+      max_tokens: 500,
+      temperature: 0.1,
     };
 
-    try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.apiKey}`
-        },
-        body: JSON.stringify(requestBody)
-      });
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify(requestBody),
+    });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        const msg = `API 调用失败 (${response.status}): ${errorText}`;
-        this.emit('error', new Error(msg));
-        throw new Error(msg);
-      }
-
-      const data = await response.json();
-
-      if (!data.choices || data.choices.length === 0) {
-        const msg = 'API 返回结果为空: 没有 choices';
-        this.emit('error', new Error(msg));
-        throw new Error(msg);
-      }
-
-      const content = data.choices[0].message.content;
-      // 去掉可能的 markdown 标记
-      const cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-
-      let action;
-      try {
-        action = JSON.parse(cleaned);
-      } catch (parseErr) {
-        const msg = `解析 AI 返回的动作失败: ${parseErr.message}, 原始内容: ${content}`;
-        this.emit('error', new Error(msg));
-        throw new Error(msg);
-      }
-
-      if (!action.type) {
-        const msg = `AI 返回的动作缺少 type 字段: ${JSON.stringify(action)}`;
-        this.emit('error', new Error(msg));
-        throw new Error(msg);
-      }
-
-      this._log(`AI 决策: ${JSON.stringify(action)}`);
-      return action;
-    } catch (err) {
-      if (err.message.startsWith('API') || err.message.startsWith('解析') || err.message.startsWith('AI')) {
-        throw err;
-      }
-      const msg = `API 请求异常: ${err.message}`;
-      this.emit('error', new Error(msg));
-      throw new Error(msg);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API 调用失败 (${response.status}): ${errorText}`);
     }
+
+    const data = await response.json();
+
+    if (!data.choices || data.choices.length === 0) {
+      throw new Error('API 返回结果为空: 没有 choices');
+    }
+
+    const content = data.choices[0].message.content;
+    // Strip markdown code blocks if present
+    const cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+
+    let action;
+    try {
+      action = JSON.parse(cleaned);
+    } catch {
+      // Try to extract JSON from the response
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          action = JSON.parse(jsonMatch[0]);
+        } catch {
+          throw new Error(`解析 AI 返回的动作失败: 原始内容: ${content.substring(0, 200)}`);
+        }
+      } else {
+        throw new Error(`解析 AI 返回的动作失败: 原始内容: ${content.substring(0, 200)}`);
+      }
+    }
+
+    if (!action.type) {
+      throw new Error(`AI 返回的动作缺少 type 字段: ${JSON.stringify(action)}`);
+    }
+
+    this._log(`AI 决策: ${JSON.stringify(action)}`);
+    return action;
   }
 
   /**
-   * 核心运行循环
-   * @param {string} userGoal - 用户的自然语言任务目标
+   * Core run loop: screenshot → analyze → execute → repeat
+   * @param {string} userGoal - User's natural language task goal
    * @returns {Promise<void>}
    */
   async run(userGoal) {
@@ -295,68 +324,73 @@ class AgentEngine extends EventEmitter {
     this.emit('start', { goal: userGoal });
     this._log(`开始执行任务: ${userGoal}`);
 
+    // Get screen size at start
+    try {
+      this.screenSize = await this.getScreenSize();
+    } catch (err) {
+      this._log(`获取屏幕尺寸失败，将继续执行: ${err.message}`);
+    }
+
     try {
       while (this.running && this.iteration < this.maxIterations) {
-        // a. 截图 -> base64
+        // Step 1: Capture screenshot
         let imageBase64;
         try {
           imageBase64 = await this.captureScreenBase64();
         } catch (err) {
-          this.emit('error', err);
+          this.emit('error', { message: err.message });
           this._log(`截图失败，等待 2 秒重试...`);
           await this._sleep(2000);
           this.iteration++;
           continue;
         }
 
-        // b. emit 'screenshot' 事件
+        // Step 2: Emit screenshot event
         this.emit('screenshot', { iteration: this.iteration, imageBase64 });
 
-        // c. 调用 analyzeScreen 获取下一步动作
+        // Step 3: Analyze screen with LLM
         let action;
         try {
           action = await this.analyzeScreen(imageBase64, userGoal, history);
         } catch (err) {
-          this.emit('error', err);
+          this.emit('error', { message: err.message });
           this._log(`分析屏幕失败，等待 2 秒重试...`);
           await this._sleep(2000);
           this.iteration++;
           continue;
         }
 
-        // d. emit 'thinking' 事件
+        // Step 4: Emit thinking event
         this.emit('thinking', { iteration: this.iteration, action });
 
-        // e. 如果 action.type === 'done'，任务完成
+        // Step 5: Check if task is done
         if (action.type === 'done') {
           this._log(`任务完成: ${action.summary || ''}`);
           this.emit('done', { summary: action.summary || '任务完成' });
           break;
         }
 
-        // f. 执行 action
+        // Step 6: Execute action
         const result = await this.executeAction(action);
 
-        // g. emit 'action' 事件
+        // Step 7: Emit action event
         this.emit('action', { iteration: this.iteration, action, result });
 
-        // 记录到历史
+        // Step 8: Record in history
         history.push({ action, result });
 
-        // h. 等待 1 秒让界面响应
-        await this._sleep(1000);
+        // Step 9: Wait for UI to respond
+        await this._sleep(1500);
 
-        // i. iteration++
         this.iteration++;
       }
 
-      // 4. 如果循环结束仍未完成
       if (this.running && this.iteration >= this.maxIterations) {
         this._log(`达到最大迭代次数 (${this.maxIterations})，停止运行`);
         this.emit('max-iterations', { iterations: this.iteration });
       }
     } catch (err) {
-      this.emit('error', err);
+      this.emit('error', { message: err.message });
     } finally {
       this.running = false;
       this._log('Agent 已停止');
@@ -364,17 +398,17 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 停止运行
+   * Stop the agent
    */
   stop() {
     this._log('收到停止信号');
     this.running = false;
   }
 
-  // ========== 内部辅助方法 ==========
+  // ========== Private helpers ==========
 
   /**
-   * 执行 adb 命令（Promise 封装）
+   * Execute adb command (Promise wrapper)
    * @param {string[]} args
    * @returns {Promise<string>}
    * @private
@@ -397,7 +431,7 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 延迟指定毫秒
+   * Sleep for specified milliseconds
    * @param {number} ms
    * @returns {Promise<void>}
    * @private
@@ -407,7 +441,7 @@ class AgentEngine extends EventEmitter {
   }
 
   /**
-   * 输出日志
+   * Log a message
    * @param {string} message
    * @private
    */

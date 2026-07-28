@@ -14,6 +14,8 @@ interface JsonRpcResponse {
 }
 
 const REQUEST_TIMEOUT_MS = 10000;
+const TAP_THRESHOLD_PX = 10;
+const LONG_PRESS_THRESHOLD_MS = 600;
 
 export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -21,20 +23,31 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
   const [casting, setCasting] = useState(false);
   const [latency, setLatency] = useState(0);
   const [frameCount, setFrameCount] = useState(0);
+  // Screen size as STATE so aspect ratio updates trigger re-render
+  const [screenSize, setScreenSize] = useState<{ w: number; h: number }>({
+    w: device.screenWidth || 720,
+    h: device.screenHeight || 1520,
+  });
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const decoderRef = useRef<VideoDecoder | null>(null);
   const latencyStartRef = useRef<number>(0);
   const reqIdRef = useRef(0);
   const pendingRef = useRef<Map<string, (res: JsonRpcResponse) => void>>(new Map());
-  const screenSizeRef = useRef<{ w: number; h: number }>({
-    w: device.screenWidth || 720,
-    h: device.screenHeight || 1520,
-  });
+  const screenSizeRef = useRef(screenSize);
   const touchStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressFiredRef = useRef(false);
+  const [longPressActive, setLongPressActive] = useState(false);
+
+  // Keep ref in sync for coordinate calculation
+  screenSizeRef.current = screenSize;
 
   const wsUrl = `ws://localhost:${port}`;
-  const aspectRatio = screenSizeRef.current.w / screenSizeRef.current.h;
+  const aspectRatio = screenSize.w / screenSize.h;
 
+  // Initialize video decoder (for future H.264 mode)
   useEffect(() => {
     if ('VideoDecoder' in window) {
       const decoder = new VideoDecoder({
@@ -61,14 +74,22 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     }
   }, []);
 
+  // Draw PNG frame to canvas and update screen size
   const drawPng = useCallback(async (data: ArrayBuffer) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     try {
       const bitmap = await createImageBitmap(new Blob([data]));
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      screenSizeRef.current = { w: bitmap.width, h: bitmap.height };
+      const newW = bitmap.width;
+      const newH = bitmap.height;
+
+      // Update screen size state if changed (triggers re-render for aspect ratio)
+      if (newW !== screenSizeRef.current.w || newH !== screenSizeRef.current.h) {
+        setScreenSize({ w: newW, h: newH });
+      }
+
+      canvas.width = newW;
+      canvas.height = newH;
       const ctx = canvas.getContext('2d');
       if (ctx) ctx.drawImage(bitmap, 0, 0);
       bitmap.close();
@@ -78,7 +99,8 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     }
   }, []);
 
-  const handleWsMessageRef = useRef<(ev: MessageEvent) => void>((_ev) => {});
+  // Stable ref for WebSocket message handler
+  const handleWsMessageRef = useRef<(ev: MessageEvent) => void>(() => {});
   handleWsMessageRef.current = (ev: MessageEvent) => {
     if (ev.data instanceof ArrayBuffer) {
       const arr = new Uint8Array(ev.data);
@@ -108,6 +130,7 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     }
   };
 
+  // WebSocket connection
   useEffect(() => {
     if (!port) return;
     setConnectionState('connecting');
@@ -115,6 +138,7 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     wsInstance.binaryType = 'arraybuffer';
     wsInstance.onopen = () => {
       setConnectionState('open');
+      // Auto-start screen cast after connection
       setTimeout(() => {
         const id = `auto-${++reqIdRef.current}`;
         pendingRef.current.set(id, () => {
@@ -129,8 +153,9 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     wsInstance.onmessage = (ev) => handleWsMessageRef.current?.(ev);
     setWs(wsInstance);
     return () => { wsInstance.close(); setWs(null); };
-  }, [port]);
+  }, [port, wsUrl]);
 
+  // JSON-RPC call helper
   const call = useCallback((method: string, params?: Record<string, unknown>): Promise<JsonRpcResponse> => {
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error('WS not open')); return; }
@@ -156,53 +181,115 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     try { await call('ping'); } catch { latencyStartRef.current = 0; }
   }, [call]);
 
-  // Unified touch input: supports tap, swipe, long press
-  const getDeviceCoords = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
+  // ===== Touch input: map mouse coords to device coords =====
+  const getDeviceCoords = useCallback((clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
     const { w, h } = screenSizeRef.current;
+    // canvas is displayed with CSS w-full h-full, so rect maps to device resolution
     const scaleX = w / rect.width;
     const scaleY = h / rect.height;
     return {
-      x: Math.round((e.clientX - rect.left) * scaleX),
-      y: Math.round((e.clientY - rect.top) * scaleY),
+      x: Math.round((clientX - rect.left) * scaleX),
+      y: Math.round((clientY - rect.top) * scaleY),
     };
-  };
-
-  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const coords = getDeviceCoords(e);
-    touchStartRef.current = { ...coords, time: Date.now() };
   }, []);
 
-  const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+  // Mouse down: start tracking touch
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return; // left click only
+    const coords = getDeviceCoords(e.clientX, e.clientY);
+    touchStartRef.current = { ...coords, time: Date.now() };
+    longPressFiredRef.current = false;
+    setLongPressActive(false);
+
+    // Start long press timer
+    longPressTimerRef.current = setTimeout(() => {
+      if (touchStartRef.current) {
+        longPressFiredRef.current = true;
+        setLongPressActive(true);
+      }
+    }, LONG_PRESS_THRESHOLD_MS);
+  }, [getDeviceCoords]);
+
+  // Mouse move: handle drag (for swipe preview)
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!touchStartRef.current) return;
+    // Cancel long press if moved too far
+    const coords = getDeviceCoords(e.clientX, e.clientY);
+    const dx = Math.abs(coords.x - touchStartRef.current.x);
+    const dy = Math.abs(coords.y - touchStartRef.current.y);
+    if (dx > TAP_THRESHOLD_PX || dy > TAP_THRESHOLD_PX) {
+      if (longPressTimerRef.current) {
+        clearTimeout(longPressTimerRef.current);
+        longPressTimerRef.current = null;
+      }
+      longPressFiredRef.current = false;
+      setLongPressActive(false);
+    }
+  }, [getDeviceCoords]);
+
+  // Mouse up: determine tap/swipe/longpress and execute
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+
     const start = touchStartRef.current;
     if (!start) return;
-    const coords = getDeviceCoords(e);
+    touchStartRef.current = null;
+
+    const coords = getDeviceCoords(e.clientX, e.clientY);
     const dx = Math.abs(coords.x - start.x);
     const dy = Math.abs(coords.y - start.y);
     const elapsed = Date.now() - start.time;
+    const wasLongPress = longPressFiredRef.current;
 
-    if (dx < 10 && dy < 10) {
-      if (elapsed > 600) {
-        call('injectInput', { type: 'longpress', x: start.x, y: start.y, duration: elapsed }).catch(() => {});
-      } else {
-        call('injectInput', { type: 'tap', x: start.x, y: start.y }).catch(() => {});
-      }
+    if (wasLongPress) {
+      // Long press - use elapsed time as duration
+      call('injectInput', { type: 'longpress', x: start.x, y: start.y, duration: elapsed }).catch(() => {});
+    } else if (dx < TAP_THRESHOLD_PX && dy < TAP_THRESHOLD_PX) {
+      // Tap
+      call('injectInput', { type: 'tap', x: start.x, y: start.y }).catch(() => {});
     } else {
+      // Swipe
       call('injectInput', {
         type: 'swipe',
         x1: start.x, y1: start.y,
         x2: coords.x, y2: coords.y,
-        duration: Math.min(elapsed, 500),
+        duration: Math.min(Math.max(elapsed, 100), 1000),
       }).catch(() => {});
     }
+    longPressFiredRef.current = false;
+    setLongPressActive(false);
+  }, [call, getDeviceCoords]);
+
+  // Mouse leave: cancel any ongoing touch
+  const handleMouseLeave = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
     touchStartRef.current = null;
-  }, [call]);
+    longPressFiredRef.current = false;
+    setLongPressActive(false);
+  }, []);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    };
+  }, []);
 
   const stateLabel = { idle: '待机', connecting: '连接中', open: '已连接', closed: '已断开', error: '错误' }[connectionState];
   const stateColor = connectionState === 'open' ? 'var(--success)' : connectionState === 'connecting' ? 'var(--accent)' : 'var(--text-tertiary)';
 
   return (
     <div className="flex flex-col h-full">
+      {/* Header bar */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-[var(--bg-secondary)] border-b border-[var(--border)] flex-shrink-0">
         <div className="flex items-center gap-2">
           <Smartphone className="w-4 h-4 text-[var(--accent)]" />
@@ -215,9 +302,7 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
         {casting && frameCount > 0 && (
           <span className="text-xs mono text-[var(--text-tertiary)]">{frameCount}f</span>
         )}
-        {screenSizeRef.current.w > 0 && (
-          <span className="text-xs mono text-[var(--text-tertiary)]">{screenSizeRef.current.w}x{screenSizeRef.current.h}</span>
-        )}
+        <span className="text-xs mono text-[var(--text-tertiary)]">{screenSize.w}x{screenSize.h}</span>
         <div className="flex-1" />
         {connectionState === 'open' && (
           <>
@@ -240,20 +325,28 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
         )}
       </div>
 
+      {/* Screen mirror area */}
       <div className="flex-1 flex items-center justify-center p-4 relative scanlines overflow-hidden">
         {connectionState === 'open' ? (
           <div
-            className="relative bg-black rounded-lg overflow-hidden shadow-2xl cursor-crosshair border border-[var(--border)]"
+            ref={containerRef}
+            className="relative bg-black rounded-lg overflow-hidden shadow-2xl border border-[var(--border)]"
             style={{
               aspectRatio: `${aspectRatio}`,
+              maxWidth: '100%',
               maxHeight: '100%',
-              height: '100%',
             }}
             onMouseDown={handleMouseDown}
             onMouseUp={handleMouseUp}
-            onMouseLeave={() => { touchStartRef.current = null; }}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+            onContextMenu={(e) => e.preventDefault()}
           >
-            <canvas ref={canvasRef} className="w-full h-full block" />
+            <canvas
+              ref={canvasRef}
+              className="w-full h-full block"
+              style={{ cursor: longPressActive ? 'grabbing' : 'crosshair' }}
+            />
             {!casting && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80">
                 <Monitor className="w-10 h-10 text-[var(--text-tertiary)] mb-2" strokeWidth={1} />
@@ -261,8 +354,13 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
               </div>
             )}
             {casting && (
-              <div className="absolute bottom-2 right-2 flex items-center gap-1 text-[10px] mono text-[var(--text-tertiary)] bg-black/60 px-2 py-0.5 rounded">
-                <MousePointerClick className="w-3 h-3" /> 点击/滑动
+              <div className="absolute bottom-2 right-2 flex items-center gap-1 text-[10px] mono text-[var(--text-tertiary)] bg-black/60 px-2 py-0.5 rounded pointer-events-none">
+                <MousePointerClick className="w-3 h-3" /> 点击/滑动/长按
+              </div>
+            )}
+            {longPressActive && (
+              <div className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] mono text-[var(--accent)] bg-black/60 px-2 py-0.5 rounded pointer-events-none">
+                长按中...
               </div>
             )}
           </div>

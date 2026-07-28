@@ -34,6 +34,7 @@ function findAdbPath() {
   const commonPaths = [
     path.join(os.homedir(), 'AppData', 'Local', 'Android', 'Sdk', 'platform-tools', 'adb.exe'),
     'C:\\Android\\platform-tools\\adb.exe',
+    'C:\\Program Files\\Android\\platform-tools\\adb.exe',
   ];
   for (const p of commonPaths) {
     if (fs.existsSync(p)) return p;
@@ -52,6 +53,7 @@ class AdbProxy {
     this.pendingShot = false;
     this.frameCount = 0;
     this.ws = null;
+    this.screenSize = null; // cached screen size
     console.log(`[AdbProxy] Using adb: ${this.adbPath}`);
   }
 
@@ -106,13 +108,20 @@ class AdbProxy {
           result = this.injectInput(params);
           break;
         case 'getScreenInfo':
-          return this.getScreenSize()
-            .then((size) => {
-              ws.send(JSON.stringify({ jsonrpc: '2.0', id, result: size, error: null }));
-            })
-            .catch((err) => {
-              ws.send(JSON.stringify({ jsonrpc: '2.0', id, result: null, error: { code: -32000, message: err.message } }));
-            });
+          // Return cached size or fetch if not available
+          if (this.screenSize) {
+            result = this.screenSize;
+          } else {
+            return this.getScreenSize()
+              .then((size) => {
+                this.screenSize = size;
+                ws.send(JSON.stringify({ jsonrpc: '2.0', id, result: size, error: null }));
+              })
+              .catch((err) => {
+                ws.send(JSON.stringify({ jsonrpc: '2.0', id, result: null, error: { code: -32000, message: err.message } }));
+              });
+          }
+          break;
         default:
           error = { code: -32601, message: `Unknown method: ${method}` };
       }
@@ -188,70 +197,118 @@ class AdbProxy {
   }
 
   /**
-   * 执行输入注入（点击/滑动/文字/按键/长按）
-   * @param {object} params - 输入参数，通过 params.type 区分动作类型
+   * Execute input injection (tap/swipe/text/keyevent/longpress)
+   * Uses execFile with array args - NO shell escaping needed since execFile bypasses shell
+   * @param {object} params - Input parameters with type field
+   * @returns {Promise<{injected: boolean}>}
    */
-  injectInput(params) {
+  async injectInput(params) {
     if (!params || !params.type) {
       return { injected: false };
     }
 
     const { type } = params;
+    const serial = this.serial;
 
-    switch (type) {
-      case 'tap': {
-        const { x, y } = params;
-        execFile(
-          this.adbPath,
-          ['-s', this.serial, 'shell', 'input', 'tap', String(x), String(y)],
-          () => {}
-        );
-        return { injected: true };
+    try {
+      switch (type) {
+        case 'tap': {
+          const { x, y } = params;
+          await this._execAdbAsync(['shell', 'input', 'tap', String(Math.round(x)), String(Math.round(y))]);
+          return { injected: true };
+        }
+        case 'swipe': {
+          const { x1, y1, x2, y2, duration = 300 } = params;
+          await this._execAdbAsync([
+            'shell', 'input', 'swipe',
+            String(Math.round(x1)), String(Math.round(y1)),
+            String(Math.round(x2)), String(Math.round(y2)),
+            String(duration)
+          ]);
+          return { injected: true };
+        }
+        case 'text': {
+          // execFile passes args directly to the process, no shell interpolation
+          // For non-ASCII text (Chinese, etc.), adb input text doesn't work natively
+          // We use a workaround: encode to URL-encoded format for ADBKeyboard
+          const text = String(params.text);
+          
+          // Check if text contains non-ASCII characters
+          if (/[^\x00-\x7F]/.test(text)) {
+            // For Chinese/Unicode text, try using adb shell am broadcast to ADBKeyboard
+            // Fallback: use `adb shell input text` with percent-encoding
+            const encoded = encodeURIComponent(text);
+            try {
+              await this._execAdbAsync(['shell', 'input', 'text', encoded]);
+              return { injected: true };
+            } catch {
+              // If that fails, try am broadcast method (requires ADBKeyboard installed)
+              try {
+                await this._execAdbAsync([
+                  'shell', 'am', 'broadcast',
+                  '-a', 'ADB_INPUT_TEXT',
+                  '--es', 'msg', text
+                ]);
+                return { injected: true };
+              } catch {
+                return { injected: false, error: '无法输入非ASCII文字，请安装 ADBKeyboard' };
+              }
+            }
+          } else {
+            // ASCII text: pass directly (execFile handles escaping)
+            await this._execAdbAsync(['shell', 'input', 'text', text]);
+            return { injected: true };
+          }
+        }
+        case 'keyevent': {
+          const { keycode } = params;
+          await this._execAdbAsync(['shell', 'input', 'keyevent', String(keycode)]);
+          return { injected: true };
+        }
+        case 'longpress': {
+          const { x, y, duration = 500 } = params;
+          await this._execAdbAsync([
+            'shell', 'input', 'swipe',
+            String(Math.round(x)), String(Math.round(y)),
+            String(Math.round(x)), String(Math.round(y)),
+            String(duration)
+          ]);
+          return { injected: true };
+        }
+        default:
+          return { injected: false, error: `Unknown input type: ${type}` };
       }
-      case 'swipe': {
-        const { x1, y1, x2, y2, duration = 300 } = params;
-        execFile(
-          this.adbPath,
-          ['-s', this.serial, 'shell', 'input', 'swipe', String(x1), String(y1), String(x2), String(y2), String(duration)],
-          () => {}
-        );
-        return { injected: true };
-      }
-      case 'text': {
-        // 转义特殊字符：空格、引号、括号、感叹号等
-        const escaped = String(params.text).replace(/([ '"\\&*?<>|;`$!()])/g, '\\$1');
-        execFile(
-          this.adbPath,
-          ['-s', this.serial, 'shell', 'input', 'text', escaped],
-          () => {}
-        );
-        return { injected: true };
-      }
-      case 'keyevent': {
-        const { keycode } = params;
-        execFile(
-          this.adbPath,
-          ['-s', this.serial, 'shell', 'input', 'keyevent', String(keycode)],
-          () => {}
-        );
-        return { injected: true };
-      }
-      case 'longpress': {
-        const { x, y, duration = 500 } = params;
-        execFile(
-          this.adbPath,
-          ['-s', this.serial, 'shell', 'input', 'swipe', String(x), String(y), String(x), String(y), String(duration)],
-          () => {}
-        );
-        return { injected: true };
-      }
-      default:
-        return { injected: false, error: `Unknown input type: ${type}` };
+    } catch (err) {
+      console.error(`[AdbProxy] injectInput error (${type}):`, err.message);
+      return { injected: false, error: err.message };
     }
   }
 
   /**
-   * 获取设备屏幕分辨率
+   * Execute adb command asynchronously (Promise wrapper)
+   * @param {string[]} args - Arguments to pass to adb
+   * @returns {Promise<string>}
+   * @private
+   */
+  _execAdbAsync(args) {
+    return new Promise((resolve, reject) => {
+      execFile(
+        this.adbPath,
+        ['-s', this.serial, ...args],
+        { maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            reject(new Error(stderr || error.message));
+          } else {
+            resolve(stdout);
+          }
+        }
+      );
+    });
+  }
+
+  /**
+   * Get device screen resolution
    * @returns {Promise<{width: number, height: number}>}
    */
   getScreenSize() {
@@ -265,7 +322,7 @@ class AdbProxy {
             reject(err);
             return;
           }
-          // 输出格式示例: "Physical size: 720x1520"
+          // Output format: "Physical size: 720x1520"
           const match = stdout.match(/(\d+)x(\d+)/);
           if (match) {
             resolve({ width: parseInt(match[1], 10), height: parseInt(match[2], 10) });
