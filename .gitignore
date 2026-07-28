@@ -1,0 +1,25 @@
+# Gradle
+android-daemon/.gradle/
+android-daemon/build/
+android-daemon/app/build/
+android-daemon/local.properties
+
+# Node
+web-ui/node_modules/
+web-ui/dist/
+web-ui/.vite/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.tmp
