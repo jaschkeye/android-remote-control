@@ -1,19 +1,20 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import ScreenMirror from './pages/ScreenMirror';
-import type { Device, DeployStatus } from './types';
+import AgentPanel from './components/AgentPanel';
+import type { Device, DeployStatus, AgentConfig } from './types';
 import { MonitorOff, Usb } from 'lucide-react';
 
 export default function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedSerial, setSelectedSerial] = useState<string | null>(null);
   const [deployStatus, setDeployStatus] = useState<Record<string, DeployStatus>>({});
+  const [agentRunning, setAgentRunning] = useState(false);
   const selectedSerialRef = useRef<string | null>(null);
 
   useEffect(() => {
     window.electronAPI.onDevicesChanged((devs) => {
       setDevices(devs);
-      // Auto-select first connected device only if nothing selected
       if (devs.length > 0 && !selectedSerialRef.current) {
         const connected = devs.find((d) => d.forwardedPort);
         if (connected) setSelectedSerial(connected.serial);
@@ -23,7 +24,6 @@ export default function App() {
       setDeployStatus((prev) => ({ ...prev, [status.serial]: status }));
     });
 
-    // Initial fetch
     window.electronAPI.getDevices().then(setDevices);
   }, []);
 
@@ -36,12 +36,31 @@ export default function App() {
     await window.electronAPI.connectDevice(serial);
   }, []);
 
+  const handleAgentRun = useCallback(async (goal: string, config: AgentConfig) => {
+    setAgentRunning(true);
+    await window.electronAPI.startAgent(goal, config);
+  }, []);
+
+  const handleAgentStop = useCallback(async () => {
+    await window.electronAPI.stopAgent();
+    setAgentRunning(false);
+  }, []);
+
+  // Listen for agent done/error to update running state
+  useEffect(() => {
+    window.electronAPI.onAgentEvent((event) => {
+      if (event.type === 'done' || event.type === 'error' || event.type === 'max-iterations') {
+        setAgentRunning(false);
+      }
+    });
+  }, []);
+
   const selectedDevice = devices.find((d) => d.serial === selectedSerial);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
-      {/* Sidebar */}
-      <div className="w-72 flex-shrink-0 bg-[var(--bg-secondary)] border-r border-[var(--border)] flex flex-col">
+      {/* Sidebar - Device List */}
+      <div className="w-64 flex-shrink-0 bg-[var(--bg-secondary)] border-r border-[var(--border)] flex flex-col">
         <Sidebar
           devices={devices}
           selectedSerial={selectedSerial}
@@ -51,8 +70,8 @@ export default function App() {
         />
       </div>
 
-      {/* Main Area */}
-      <div className="flex-1 flex flex-col grid-bg">
+      {/* Center - Screen Mirror */}
+      <div className="flex-1 flex flex-col grid-bg min-w-0">
         {selectedDevice?.forwardedPort ? (
           <ScreenMirror port={selectedDevice.forwardedPort} device={selectedDevice} />
         ) : (
@@ -82,6 +101,15 @@ export default function App() {
             </div>
           </div>
         )}
+      </div>
+
+      {/* Right - AI Agent Panel */}
+      <div className="w-80 flex-shrink-0 border-l border-[var(--border)]">
+        <AgentPanel
+          onRun={handleAgentRun}
+          onStop={handleAgentStop}
+          running={agentRunning}
+        />
       </div>
     </div>
   );

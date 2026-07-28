@@ -1,14 +1,8 @@
 const { AdbManager } = require('./adb');
-const path = require('path');
-const fs = require('fs');
+const { AdbProxy, PROXY_PORT } = require('./adb-proxy');
 const { EventEmitter } = require('events');
 
-const DAEMON_REMOTE_PATH = '/data/local/tmp/remote-daemon.jar';
-const DAEMON_PORT = 27183;
-const FORWARD_LOCAL = `tcp:${DAEMON_PORT}`;
-const FORWARD_REMOTE = `tcp:${DAEMON_PORT}`;
 const POLL_INTERVAL_MS = 2000;
-const DAEMON_STARTUP_DELAY_MS = 1500;
 
 class DeviceManager extends EventEmitter {
   constructor() {
@@ -17,6 +11,7 @@ class DeviceManager extends EventEmitter {
     this.devices = new Map();
     this.pollTimer = null;
     this.deployedDevices = new Set();
+    this.proxies = new Map();
   }
 
   start() {
@@ -29,10 +24,10 @@ class DeviceManager extends EventEmitter {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    // Remove all forwards
-    for (const serial of this.devices.keys()) {
-      this.adb.forwardRemove(serial, FORWARD_LOCAL).catch(() => {});
+    for (const proxy of this.proxies.values()) {
+      proxy.stop();
     }
+    this.proxies.clear();
   }
 
   async poll() {
@@ -40,7 +35,6 @@ class DeviceManager extends EventEmitter {
       const rawDevices = await this.adb.getDevices();
       const currentSerials = new Set(rawDevices.map((d) => d.serial));
 
-      // Detect new devices
       for (const dev of rawDevices) {
         if (!this.devices.has(dev.serial)) {
           const device = {
@@ -52,13 +46,20 @@ class DeviceManager extends EventEmitter {
             rootAvailable: false,
             daemonRunning: false,
             forwardedPort: null,
+            screenWidth: 0,
+            screenHeight: 0,
           };
-          // Fetch device info
           if (dev.state === 'device') {
             device.model = await this.adb.getDeviceProp(dev.serial, 'ro.product.model');
             device.androidVersion = await this.adb.getDeviceProp(dev.serial, 'ro.build.version.release');
             device.sdk = await this.adb.getDeviceProp(dev.serial, 'ro.build.version.sdk');
             device.rootAvailable = await this.checkRoot(dev.serial);
+            // 获取设备屏幕分辨率并缓存
+            const size = await this.getDeviceScreenSize(dev.serial);
+            if (size) {
+              device.screenWidth = size.width;
+              device.screenHeight = size.height;
+            }
           }
           this.devices.set(dev.serial, device);
           this.emit('device-connected', device);
@@ -66,11 +67,12 @@ class DeviceManager extends EventEmitter {
         }
       }
 
-      // Detect disconnected devices
       for (const serial of this.devices.keys()) {
         if (!currentSerials.has(serial)) {
           this.devices.delete(serial);
           this.deployedDevices.delete(serial);
+          const proxy = this.proxies.get(serial);
+          if (proxy) { proxy.stop(); this.proxies.delete(serial); }
           this.emit('device-disconnected', serial);
           this.emit('devices-changed', this.getDevices());
         }
@@ -89,85 +91,44 @@ class DeviceManager extends EventEmitter {
     }
   }
 
+  async getDeviceScreenSize(serial) {
+    try {
+      const output = await this.adb.shell(serial, 'wm size');
+      // 输出格式示例: "Physical size: 720x1520"
+      const match = output.match(/(\d+)x(\d+)/);
+      if (match) {
+        return { width: parseInt(match[1], 10), height: parseInt(match[2], 10) };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async autoDeploy(serial) {
     const device = this.devices.get(serial);
     if (!device || device.state !== 'device') return;
     if (this.deployedDevices.has(serial)) return;
 
-    this.emit('deploy-status', { serial, stage: 'checking', message: '检查设备状态...' });
+    this.emit('deploy-status', { serial, stage: 'checking', message: '初始化 ADB 代理...' });
 
-    // Check if daemon is already running
+    // Stop existing proxy if any
+    const existingProxy = this.proxies.get(serial);
+    if (existingProxy) { existingProxy.stop(); }
+
+    // Start ADB proxy (replaces the Kotlin daemon)
     try {
-      const checkResult = await this.adb.shell(serial, 'pgrep -f remote-daemon');
-      if (checkResult.trim()) {
-        this.emit('deploy-status', { serial, stage: 'running', message: 'Daemon 已在运行' });
-        device.daemonRunning = true;
-        await this.setupForward(serial);
-        this.emit('devices-changed', this.getDevices());
-        return;
-      }
-    } catch {
-      // Not running
-    }
-
-    // Find daemon jar
-    const jarPath = this.findDaemonJar();
-    if (!jarPath) {
-      this.emit('deploy-status', { serial, stage: 'error', message: '未找到 daemon.jar，请先编译 android-daemon' });
-      return;
-    }
-
-    // Push jar
-    this.emit('deploy-status', { serial, stage: 'pushing', message: '推送 daemon.jar...' });
-    try {
-      await this.adb.pushFile(serial, jarPath, DAEMON_REMOTE_PATH);
-    } catch (err) {
-      this.emit('deploy-status', { serial, stage: 'error', message: `推送失败: ${err.message}` });
-      return;
-    }
-
-    // Start daemon
-    this.emit('deploy-status', { serial, stage: 'starting', message: '启动 daemon...' });
-    try {
-      const startCmd = `CLASSPATH=${DAEMON_REMOTE_PATH} app_process / com.remote.daemon.Main > /dev/null 2>&1 &`;
-      await this.adb.shell(serial, startCmd);
-      // Wait a moment for startup
-      await new Promise((r) => setTimeout(r, DAEMON_STARTUP_DELAY_MS));
+      const proxy = new AdbProxy(serial);
+      await proxy.start();
+      this.proxies.set(serial, proxy);
       device.daemonRunning = true;
+      device.forwardedPort = PROXY_PORT;
       this.deployedDevices.add(serial);
-      this.emit('deploy-status', { serial, stage: 'done', message: 'Daemon 启动成功' });
-
-      // Setup port forwarding
-      await this.setupForward(serial);
+      this.emit('deploy-status', { serial, stage: 'done', message: 'ADB 代理就绪 (PNG 模式)' });
       this.emit('devices-changed', this.getDevices());
     } catch (err) {
-      this.emit('deploy-status', { serial, stage: 'error', message: `启动失败: ${err.message}` });
+      this.emit('deploy-status', { serial, stage: 'error', message: `代理启动失败: ${err.message}` });
     }
-  }
-
-  async setupForward(serial) {
-    try {
-      await this.adb.forward(serial, FORWARD_LOCAL, FORWARD_REMOTE);
-      const device = this.devices.get(serial);
-      if (device) {
-        device.forwardedPort = DAEMON_PORT;
-        this.emit('devices-changed', this.getDevices());
-      }
-    } catch (err) {
-      this.emit('deploy-status', { serial, stage: 'error', message: `端口转发失败: ${err.message}` });
-    }
-  }
-
-  findDaemonJar() {
-    const candidates = [
-      path.join(__dirname, '..', 'resources', 'remote-daemon.jar'),
-      path.join(__dirname, '..', 'android-daemon', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'),
-      path.join(__dirname, '..', 'android-daemon', 'app', 'build', 'outputs', 'jar', 'remote-daemon.jar'),
-    ];
-    for (const p of candidates) {
-      if (fs.existsSync(p)) return p;
-    }
-    return null;
   }
 
   getDevices() {
@@ -185,16 +146,15 @@ class DeviceManager extends EventEmitter {
   }
 
   async disconnectDevice(serial) {
-    try {
-      await this.adb.forwardRemove(serial, FORWARD_LOCAL);
-      const device = this.devices.get(serial);
-      if (device) {
-        device.forwardedPort = null;
-        device.daemonRunning = false;
-      }
-      this.deployedDevices.delete(serial);
-      this.emit('devices-changed', this.getDevices());
-    } catch {}
+    const proxy = this.proxies.get(serial);
+    if (proxy) { proxy.stop(); this.proxies.delete(serial); }
+    const device = this.devices.get(serial);
+    if (device) {
+      device.forwardedPort = null;
+      device.daemonRunning = false;
+    }
+    this.deployedDevices.delete(serial);
+    this.emit('devices-changed', this.getDevices());
   }
 }
 
