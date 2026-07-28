@@ -1,7 +1,19 @@
-const { exec, execFile } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+
+const MAX_BUFFER = 10 * 1024 * 1024;
+const STREAM_MAX_BUFFER = 100 * 1024 * 1024;
+
+// Serial numbers are alphanumeric + colons (USB) or IP:port (TCP)
+const SERIAL_PATTERN = /^[a-zA-Z0-9:._-]+$/;
+
+function validateSerial(serial) {
+  if (!serial || !SERIAL_PATTERN.test(serial)) {
+    throw new Error(`Invalid device serial: ${serial}`);
+  }
+}
 
 class AdbManager {
   constructor() {
@@ -38,7 +50,7 @@ class AdbManager {
 
   async ensureAdb() {
     try {
-      await this.exec('start-server');
+      await this.exec(['start-server']);
       return true;
     } catch {
       return false;
@@ -47,7 +59,7 @@ class AdbManager {
 
   async getDevices() {
     try {
-      const output = await this.exec('devices');
+      const output = await this.exec(['devices']);
       const lines = output.trim().split('\n').slice(1);
       return lines
         .map((line) => {
@@ -64,8 +76,9 @@ class AdbManager {
   }
 
   async getDeviceProp(serial, prop) {
+    validateSerial(serial);
     try {
-      const output = await this.exec(`-s ${serial} shell getprop ${prop}`);
+      const output = await this.exec(['-s', serial, 'shell', 'getprop', prop]);
       return output.trim();
     } catch {
       return '';
@@ -73,25 +86,28 @@ class AdbManager {
   }
 
   async pushFile(serial, localPath, remotePath) {
-    return this.exec(`-s ${serial} push "${localPath}" "${remotePath}"`);
+    validateSerial(serial);
+    return this.exec(['-s', serial, 'push', localPath, remotePath]);
   }
 
   async shell(serial, command) {
-    return this.exec(`-s ${serial} shell ${command}`);
+    validateSerial(serial);
+    return this.exec(['-s', serial, 'shell', command]);
   }
 
   async forward(serial, local, remote) {
-    return this.exec(`-s ${serial} forward ${local} ${remote}`);
+    validateSerial(serial);
+    return this.exec(['-s', serial, 'forward', local, remote]);
   }
 
   async forwardRemove(serial, local) {
-    return this.exec(`-s ${serial} forward --remove ${local}`);
+    validateSerial(serial);
+    return this.exec(['-s', serial, 'forward', '--remove', local]);
   }
 
   async exec(args) {
     return new Promise((resolve, reject) => {
-      const fullArgs = args.split(' ');
-      execFile(this.adbPath, fullArgs, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      execFile(this.adbPath, args, { maxBuffer: MAX_BUFFER }, (err, stdout, stderr) => {
         if (err) {
           reject(new Error(`${err.message}\n${stderr}`));
         } else {
@@ -102,11 +118,12 @@ class AdbManager {
   }
 
   async execStream(serial, command, onData) {
+    validateSerial(serial);
     return new Promise((resolve, reject) => {
       const proc = execFile(
         this.adbPath,
         ['-s', serial, 'shell', command],
-        { maxBuffer: 100 * 1024 * 1024 }
+        { maxBuffer: STREAM_MAX_BUFFER }
       );
       proc.stdout?.on('data', (data) => onData(data.toString()));
       proc.stderr?.on('data', (data) => onData(data.toString()));

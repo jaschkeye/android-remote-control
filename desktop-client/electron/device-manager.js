@@ -7,7 +7,8 @@ const DAEMON_REMOTE_PATH = '/data/local/tmp/remote-daemon.jar';
 const DAEMON_PORT = 27183;
 const FORWARD_LOCAL = `tcp:${DAEMON_PORT}`;
 const FORWARD_REMOTE = `tcp:${DAEMON_PORT}`;
-const POLL_INTERVAL = 2000;
+const POLL_INTERVAL_MS = 2000;
+const DAEMON_STARTUP_DELAY_MS = 1500;
 
 class DeviceManager extends EventEmitter {
   constructor() {
@@ -20,7 +21,7 @@ class DeviceManager extends EventEmitter {
 
   start() {
     this.poll();
-    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL);
+    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
   }
 
   stop() {
@@ -131,7 +132,7 @@ class DeviceManager extends EventEmitter {
       const startCmd = `CLASSPATH=${DAEMON_REMOTE_PATH} app_process / com.remote.daemon.Main > /dev/null 2>&1 &`;
       await this.adb.shell(serial, startCmd);
       // Wait a moment for startup
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, DAEMON_STARTUP_DELAY_MS));
       device.daemonRunning = true;
       this.deployedDevices.add(serial);
       this.emit('deploy-status', { serial, stage: 'done', message: 'Daemon 启动成功' });

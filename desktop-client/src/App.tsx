@@ -1,19 +1,20 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import ScreenMirror from './pages/ScreenMirror';
-import type { Device, DeployStatus } from './main';
+import type { Device, DeployStatus } from './types';
 import { MonitorOff, Usb } from 'lucide-react';
 
 export default function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedSerial, setSelectedSerial] = useState<string | null>(null);
   const [deployStatus, setDeployStatus] = useState<Record<string, DeployStatus>>({});
+  const selectedSerialRef = useRef<string | null>(null);
 
   useEffect(() => {
     window.electronAPI.onDevicesChanged((devs) => {
       setDevices(devs);
-      // Auto-select first connected device
-      if (devs.length > 0 && !selectedSerial) {
+      // Auto-select first connected device only if nothing selected
+      if (devs.length > 0 && !selectedSerialRef.current) {
         const connected = devs.find((d) => d.forwardedPort);
         if (connected) setSelectedSerial(connected.serial);
       }
@@ -26,15 +27,16 @@ export default function App() {
     window.electronAPI.getDevices().then(setDevices);
   }, []);
 
-  const selectedDevice = devices.find((d) => d.serial === selectedSerial);
-
   const handleSelect = useCallback((serial: string) => {
+    selectedSerialRef.current = serial;
     setSelectedSerial(serial);
   }, []);
 
   const handleConnect = useCallback(async (serial: string) => {
     await window.electronAPI.connectDevice(serial);
   }, []);
+
+  const selectedDevice = devices.find((d) => d.serial === selectedSerial);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">

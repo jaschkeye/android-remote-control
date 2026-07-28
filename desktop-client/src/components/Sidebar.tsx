@@ -1,5 +1,5 @@
 import { Smartphone, Shield, Wifi, Loader2, CheckCircle2, AlertCircle, ChevronRight } from 'lucide-react';
-import type { Device, DeployStatus } from '../main';
+import type { Device, DeployStatus } from '../types';
 
 interface SidebarProps {
   devices: Device[];

@@ -92,6 +92,17 @@ ipcMain.handle('get-forwarded-port', async (event, serial) => {
   return deviceManager?.getForwardedPort(serial);
 });
 
+const ALLOWED_PROTOCOLS = ['https:', 'http:'];
+
 ipcMain.handle('open-external', async (event, url) => {
-  shell.openExternal(url);
+  try {
+    const parsed = new URL(url);
+    if (!ALLOWED_PROTOCOLS.includes(parsed.protocol)) {
+      console.error(`[Main] Blocked open-external for protocol: ${parsed.protocol}`);
+      return;
+    }
+    shell.openExternal(url);
+  } catch {
+    console.error(`[Main] Invalid URL for open-external: ${url}`);
+  }
 });

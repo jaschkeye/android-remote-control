@@ -2,10 +2,11 @@
   "name": "android-remote-control-desktop",
   "version": "0.1.0",
   "description": "Windows desktop client for Android Remote Control",
-  "main": "dist-electron/main.js",
+  "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
     "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5174 && electron .\"",
     "electron:build": "npm run build && electron-builder",
     "preview": "vite preview"
@@ -43,6 +44,6 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     },
-    "files": ["dist/**/*", "dist-electron/**/*"]
+    "files": ["dist/**/*", "electron/**/*", "package.json"]
   }
 }

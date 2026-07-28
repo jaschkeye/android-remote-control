@@ -1,14 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Monitor, Power, Activity, MousePointerClick } from 'lucide-react';
-import type { Device } from '../main';
+import type { Device } from '../types';
 
 interface ScreenMirrorProps {
   port: number;
   device: Device;
 }
 
+interface JsonRpcResponse {
+  id?: string;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
+
 const REMOTE_WIDTH = 1280;
 const REMOTE_HEIGHT = 720;
+const REQUEST_TIMEOUT_MS = 10000;
 
 export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -19,7 +26,7 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
   const decoderRef = useRef<VideoDecoder | null>(null);
   const latencyStartRef = useRef<number>(0);
   const reqIdRef = useRef(0);
-  const pendingRef = useRef<Map<string, (res: any) => void>>(new Map());
+  const pendingRef = useRef<Map<string, (res: JsonRpcResponse) => void>>(new Map());
 
   const wsUrl = `ws://localhost:${port}`;
 
@@ -91,9 +98,9 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
     wsInstance.onmessage = handleWsMessage;
     setWs(wsInstance);
     return () => { wsInstance.close(); setWs(null); };
-  }, [port]);
+  }, [port, wsUrl, handleWsMessage]);
 
-  const call = useCallback((method: string, params?: Record<string, unknown>): Promise<any> => {
+  const call = useCallback((method: string, params?: Record<string, unknown>): Promise<JsonRpcResponse> => {
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error('WS not open')); return; }
       const id = `${++reqIdRef.current}`;
@@ -101,7 +108,7 @@ export default function ScreenMirror({ port, device }: ScreenMirrorProps) {
       ws.send(JSON.stringify({ id, method, params }));
       setTimeout(() => {
         if (pendingRef.current.has(id)) { pendingRef.current.delete(id); reject(new Error('Timeout')); }
-      }, 10000);
+      }, REQUEST_TIMEOUT_MS);
     });
   }, [ws]);
 
