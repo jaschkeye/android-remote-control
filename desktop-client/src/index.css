@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #0a0e14;
+  --bg-secondary: #111720;
+  --bg-tertiary: #1a2030;
+  --border: #252d3d;
+  --accent: #f59e0b;
+  --accent-dim: #b45309;
+  --accent-glow: rgba(245, 158, 11, 0.15);
+  --text-primary: #e2e8f0;
+  --text-secondary: #64748b;
+  --text-tertiary: #475569;
+  --success: #22c55e;
+  --danger: #ef4444;
+  --info: #3b82f6;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+input, button, textarea { -webkit-app-region: no-drag; }
+
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+/* Grid background */
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(37, 45, 61, 0.3) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 45, 61, 0.3) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Scan line effect for screen mirror */
+.scanlines::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(245, 158, 11, 0.02) 2px,
+    rgba(245, 158, 11, 0.02) 4px
+  );
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Pulsing status dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 currentColor; }
+  50% { opacity: 0.7; box-shadow: 0 0 0 4px transparent; }
+}
+.pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+
+/* Slide in animation */
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.slide-in { animation: slide-in 0.3s ease-out; }
+
+/* Glow effect */
+.glow-accent { box-shadow: 0 0 20px var(--accent-glow); }
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }

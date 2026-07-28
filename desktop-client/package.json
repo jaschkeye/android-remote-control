@@ -1,0 +1,48 @@
+{
+  "name": "android-remote-control-desktop",
+  "version": "0.1.0",
+  "description": "Windows desktop client for Android Remote Control",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5174 && electron .\"",
+    "electron:build": "npm run build && electron-builder",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "lucide-react": "^0.400.0",
+    "clsx": "^2.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/node": "^20.14.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.19",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.4",
+    "concurrently": "^8.2.2",
+    "wait-on": "^7.2.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.3.0"
+  },
+  "build": {
+    "appId": "com.remote.android-control",
+    "productName": "Android Remote Control",
+    "win": {
+      "target": ["nsis"],
+      "icon": "resources/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "files": ["dist/**/*", "dist-electron/**/*"]
+  }
+}
