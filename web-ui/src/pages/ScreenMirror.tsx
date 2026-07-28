@@ -3,15 +3,20 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import VideoDecoder, { type VideoDecoderHandle } from '../components/VideoDecoder';
 import { Monitor, Power, Wifi } from 'lucide-react';
 
-const WS_URL = 'ws://192.168.1.100:27183';
+const DEFAULT_PORT = 27183;
+const REMOTE_WIDTH = 1280;
+const REMOTE_HEIGHT = 720;
 
 export default function ScreenMirror() {
-  const { connect, disconnect, call, state, ws } = useWebSocket(WS_URL);
+  const { connect, disconnect, call, state, ws } = useWebSocket();
   const [deviceIp, setDeviceIp] = useState('192.168.1.100');
+  const [pairCode, setPairCode] = useState('');
   const [casting, setCasting] = useState(false);
   const [latency, setLatency] = useState(0);
   const decoderRef = useRef<VideoDecoderHandle>(null);
   const latencyStartRef = useRef<number>(0);
+
+  const wsUrl = `ws://${deviceIp}:${DEFAULT_PORT}`;
 
   useEffect(() => {
     const wsInstance = ws.current;
@@ -32,8 +37,8 @@ export default function ScreenMirror() {
   }, [ws]);
 
   const handleConnect = useCallback(() => {
-    connect();
-  }, [connect]);
+    connect(wsUrl);
+  }, [connect, wsUrl]);
 
   const handleDisconnect = useCallback(() => {
     disconnect();
@@ -42,12 +47,15 @@ export default function ScreenMirror() {
 
   const handleStartCast = useCallback(async () => {
     try {
+      if (pairCode) {
+        await call('auth', { code: pairCode });
+      }
       await call('startScreenCast');
       setCasting(true);
     } catch (e) {
       console.error('startScreenCast failed', e);
     }
-  }, [call]);
+  }, [call, pairCode]);
 
   const handleStopCast = useCallback(async () => {
     try {
@@ -58,39 +66,26 @@ export default function ScreenMirror() {
     }
   }, [call]);
 
-  const sendTouch = useCallback(
-    async (action: number, x: number, y: number) => {
-      try {
-        await call('injectInput', { type: 'touch', action, x, y });
-      } catch {
-        /* ignore */
-      }
+  const sendTouchAt = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, action: number) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const scaleX = REMOTE_WIDTH / rect.width;
+      const scaleY = REMOTE_HEIGHT / rect.height;
+      const x = Math.round((e.clientX - rect.left) * scaleX);
+      const y = Math.round((e.clientY - rect.top) * scaleY);
+      call('injectInput', { type: 'touch', action, x, y }).catch(() => {});
     },
     [call]
   );
 
   const handleMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const scaleX = 1280 / rect.width;
-      const scaleY = 720 / rect.height;
-      const x = Math.round((e.clientX - rect.left) * scaleX);
-      const y = Math.round((e.clientY - rect.top) * scaleY);
-      sendTouch(0, x, y); // ACTION_DOWN = 0
-    },
-    [sendTouch]
+    (e: React.MouseEvent<HTMLDivElement>) => sendTouchAt(e, 0), // ACTION_DOWN
+    [sendTouchAt]
   );
 
   const handleMouseUp = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const scaleX = 1280 / rect.width;
-      const scaleY = 720 / rect.height;
-      const x = Math.round((e.clientX - rect.left) * scaleX);
-      const y = Math.round((e.clientY - rect.top) * scaleY);
-      sendTouch(1, x, y); // ACTION_UP = 1
-    },
-    [sendTouch]
+    (e: React.MouseEvent<HTMLDivElement>) => sendTouchAt(e, 1), // ACTION_UP
+    [sendTouchAt]
   );
 
   const handlePing = useCallback(async () => {
@@ -119,6 +114,13 @@ export default function ScreenMirror() {
             placeholder="IP 地址"
           />
         </div>
+
+        <input
+          value={pairCode}
+          onChange={(e) => setPairCode(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs w-24"
+          placeholder="配对码"
+        />
 
         {state !== 'open' ? (
           <button

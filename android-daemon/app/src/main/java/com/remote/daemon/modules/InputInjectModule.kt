@@ -3,6 +3,7 @@ package com.remote.daemon.modules
 import android.hardware.input.InputManager
 import android.os.SystemClock
 import android.view.InputDevice
+import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -20,18 +21,16 @@ class InputInjectModule {
             inputManager = android.app.ActivityThread.currentApplication()
                 ?.getSystemService(android.content.Context.INPUT_SERVICE) as? InputManager
             if (inputManager == null) {
-                // Fallback: get InputManager via reflection
                 val imClass = Class.forName("android.hardware.input.InputManager")
                 val getInstance = imClass.getMethod("getInstance")
                 inputManager = getInstance.invoke(null) as InputManager
             }
-            // InputManager.injectInputEvent is hidden API
             injectInputEventMethod = InputManager::class.java.getMethod(
-                "injectInputEvent", android.view.InputEvent::class.java, Int::class.java
+                "injectInputEvent", InputEvent::class.java, Int::class.java
             )
         } catch (e: Exception) {
             e.printStackTrace()
-            println("[InputInject] Failed to get InputManager via reflection: ${e.message}")
+            println("[InputInject] InputManager reflection failed: ${e.message}")
         }
     }
 
@@ -63,7 +62,9 @@ class InputInjectModule {
         )
 
         val success = injectEvent(event, 0)
-        println("[InputInject] Touch action=$action x=$x y=$y success=$success")
+        if (!success) {
+            shellInjectTouch(action, x.toInt(), y.toInt())
+        }
         event.recycle()
     }
 
@@ -80,38 +81,41 @@ class InputInjectModule {
         )
 
         val success = injectEvent(event, 0)
-        println("[InputInject] Key action=$action keyCode=$keyCode success=$success")
+        if (!success) {
+            shellInjectKey(action, keyCode)
+        }
     }
 
-    private fun injectEvent(event: android.view.InputEvent, mode: Int): Boolean {
+    private fun injectEvent(event: InputEvent, mode: Int): Boolean {
         return try {
             injectInputEventMethod?.invoke(inputManager, event, mode) as? Boolean ?: false
         } catch (e: Exception) {
-            // Fallback to shell command if reflection fails
-            shellInjectFallback(event)
             false
         }
     }
 
-    private fun shellInjectFallback(event: android.view.InputEvent) {
-        when (event) {
-            is MotionEvent -> {
-                val actionStr = when (event.action) {
-                    MotionEvent.ACTION_DOWN -> "tap"
-                    else -> "tap"
+    private fun shellInjectTouch(action: Int, x: Int, y: Int) {
+        try {
+            when (action) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP -> {
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "input", "tap", x.toString(), y.toString()))
                 }
-                if (actionStr == "tap") {
-                    val x = event.rawX.toInt()
-                    val y = event.rawY.toInt()
-                    Runtime.getRuntime().exec("su -c input tap $x $y")
+                else -> {
+                    println("[InputInject] Shell fallback only supports tap, ignoring action=$action")
                 }
             }
-            is KeyEvent -> {
-                val actionStr = if (event.action == KeyEvent.ACTION_DOWN) "keyevent" else null
-                if (actionStr != null) {
-                    Runtime.getRuntime().exec("su -c input $actionStr ${event.keyCode}")
-                }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun shellInjectKey(action: Int, keyCode: Int) {
+        try {
+            if (action == KeyEvent.ACTION_DOWN) {
+                Runtime.getRuntime().exec(arrayOf("su", "-c", "input", "keyevent", keyCode.toString()))
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 }

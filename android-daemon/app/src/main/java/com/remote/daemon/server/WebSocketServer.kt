@@ -13,6 +13,12 @@ import java.net.InetSocketAddress
 
 class WebSocketServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
 
+    companion object {
+        // MVP 配对码：生产环境应从配置文件读取，此处仅作演示
+        private const val PAIR_CODE = "000000"
+        private const val AUTH_KEY = "authenticated"
+    }
+
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val screenCastModule = ScreenCastModule()
     private val inputInjectModule = InputInjectModule()
@@ -22,26 +28,45 @@ class WebSocketServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
     }
 
     override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
-        println("[WSServer] Client disconnected: ${conn.remoteSocketAddress} (code=$code, reason=$reason)")
+        println("[WSServer] Client disconnected: ${conn.remoteSocketAddress} (code=$code)")
         screenCastModule.stop(conn)
     }
 
     override fun onMessage(conn: WebSocket, message: String) {
-        println("[WSServer] Received: $message")
         try {
             val request = json.decodeFromString<JsonRpcRequest>(message)
             handleRequest(conn, request)
         } catch (e: Exception) {
-            val error = JsonRpcResponse(
-                id = null,
-                error = JsonRpcResponse.Error(code = -32700, message = "Parse error: ${e.message}"),
-                result = null
-            )
-            conn.send(json.encodeToString(error))
+            sendError(conn, null, -32700, "Parse error: ${e.message}")
         }
     }
 
     private fun handleRequest(conn: WebSocket, request: JsonRpcRequest) {
+        // auth 方法不需要认证
+        if (request.method == "auth") {
+            val code = request.params?.get("code")?.toString()?.trim('"')
+            if (code == PAIR_CODE) {
+                conn.setAttachment(AUTH_KEY, true)
+                respond(conn, request.id, "authenticated")
+            } else {
+                sendError(conn, request.id, -32001, "Invalid pair code")
+            }
+            return
+        }
+
+        // ping 也不需要认证（用于延迟测试）
+        if (request.method == "ping") {
+            respond(conn, request.id, "pong")
+            return
+        }
+
+        // 其他方法需要认证
+        val authenticated = conn.getAttachment<Boolean>(AUTH_KEY) ?: false
+        if (!authenticated) {
+            sendError(conn, request.id, -32000, "Not authenticated. Send 'auth' with pair code first.")
+            return
+        }
+
         when (request.method) {
             "startScreenCast" -> {
                 screenCastModule.start(conn) { result ->
@@ -57,16 +82,8 @@ class WebSocketServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
                 inputInjectModule.inject(params)
                 respond(conn, request.id, "ok")
             }
-            "ping" -> {
-                respond(conn, request.id, "pong")
-            }
             else -> {
-                val error = JsonRpcResponse(
-                    id = request.id,
-                    error = JsonRpcResponse.Error(code = -32601, message = "Method not found: ${request.method}"),
-                    result = null
-                )
-                conn.send(json.encodeToString(error))
+                sendError(conn, request.id, -32601, "Method not found: ${request.method}")
             }
         }
     }
@@ -76,12 +93,22 @@ class WebSocketServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
         conn.send(json.encodeToString(response))
     }
 
+    private fun sendError(conn: WebSocket, id: String?, code: Int, message: String) {
+        val response = JsonRpcResponse(
+            id = id,
+            error = JsonRpcResponse.Error(code = code, message = message),
+            result = null
+        )
+        conn.send(json.encodeToString(response))
+    }
+
     override fun onError(conn: WebSocket?, ex: Exception) {
         println("[WSServer] Error: ${ex.message}")
         ex.printStackTrace()
     }
 
     override fun onStart() {
-        println("[WSServer] Server started on port $port")
+        println("[WSServer] Server started on port $address")
+        println("[WSServer] Pair code: $PAIR_CODE")
     }
 }

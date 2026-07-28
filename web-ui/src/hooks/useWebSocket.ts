@@ -3,17 +3,12 @@ import { buildRequest, type JsonRpcRequest, type JsonRpcResponse } from '../lib/
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
 
-export interface WsMessage {
-  type: 'json' | 'binary';
-  data: string | ArrayBuffer | Blob;
-}
-
-export function useWebSocket(url: string) {
+export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const [state, setState] = useState<ConnectionState>('idle');
   const pendingRef = useRef<Map<string, (res: JsonRpcResponse) => void>>(new Map());
 
-  const connect = useCallback(() => {
+  const connect = useCallback((url: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
     setState('connecting');
     const ws = new WebSocket(url);
@@ -21,7 +16,6 @@ export function useWebSocket(url: string) {
 
     ws.onopen = () => {
       setState('open');
-      console.log('[WS] Connected');
     };
     ws.onclose = () => {
       setState('closed');
@@ -46,7 +40,7 @@ export function useWebSocket(url: string) {
     };
 
     wsRef.current = ws;
-  }, [url]);
+  }, []);
 
   const disconnect = useCallback(() => {
     wsRef.current?.close();
@@ -72,10 +66,6 @@ export function useWebSocket(url: string) {
     });
   }, []);
 
-  const sendBinary = useCallback((data: ArrayBuffer | Blob) => {
-    wsRef.current?.send(data);
-  }, []);
-
   const call = useCallback(
     async (method: string, params?: Record<string, unknown>) => {
       const req = buildRequest(method, params);
@@ -90,5 +80,5 @@ export function useWebSocket(url: string) {
     };
   }, []);
 
-  return { connect, disconnect, send, sendBinary, call, state, ws: wsRef };
+  return { connect, disconnect, call, state, ws: wsRef };
 }
